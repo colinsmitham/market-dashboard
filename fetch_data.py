@@ -159,8 +159,10 @@ def fetch_stooq(symbol: str, start: date) -> pd.Series:
 # 2. DATA CHECKS
 # -----------------------------------------------------------------------------
 
-def clean_and_validate(closes: pd.Series, min_rows: int) -> pd.Series:
-    """Tidy the series and raise ValueError if it doesn't look trustworthy."""
+def clean_and_validate(closes: pd.Series, min_rows: int, max_jump: float | None = 0.25) -> pd.Series:
+    """Tidy the series and raise ValueError if it doesn't look trustworthy.
+    max_jump: largest believable one-day move (0.25 = 25%). Use None to skip
+    the check for series that genuinely jump a lot, like the VIX."""
     s = pd.Series(closes, dtype="float64")
     s = s[~s.index.duplicated(keep="last")].sort_index()
     s = s.dropna()
@@ -175,8 +177,9 @@ def clean_and_validate(closes: pd.Series, min_rows: int) -> pd.Series:
         raise ValueError(f"latest close is {s.index[-1]} ({age} days old)")
     # A one-day move of more than 25% in QQQ almost certainly means bad data
     # (e.g. an unadjusted split), not a real market move.
+    # (The VIX skips this check: it can rise 25%+ in a single day.)
     worst = s.pct_change().abs().max()
-    if worst > 0.25:
+    if max_jump is not None and worst > max_jump:
         raise ValueError(f"suspicious one-day jump of {worst:.0%} in the data")
     return s
 
@@ -192,12 +195,13 @@ def drop_unfinished_session(s: pd.Series) -> pd.Series:
     return s
 
 
-def get_prices(sources: list[tuple[str, callable]], min_rows: int) -> tuple[pd.Series, str]:
+def get_prices(sources: list[tuple[str, callable]], min_rows: int,
+               max_jump: float | None = 0.25) -> tuple[pd.Series, str]:
     """Try each source in order; return the first one that passes the checks."""
     errors = []
     for name, fetch in sources:
         try:
-            s = clean_and_validate(fetch(), min_rows)
+            s = clean_and_validate(fetch(), min_rows, max_jump)
             log.info("Using %s: %d rows, latest close %s = %.2f", name, len(s), s.index[-1], s.iloc[-1])
             return s, name
         except Exception as exc:  # any failure -> try the next source
@@ -364,7 +368,7 @@ def fetch_vix(start: date) -> dict | None:
     sources = [("yfinance", lambda: fetch_yfinance(VIX_TICKER, start)),
                ("yahoo-chart", lambda: fetch_yahoo_chart(VIX_TICKER, start))]
     try:
-        s, _ = get_prices(sources, min_rows=20)
+        s, _ = get_prices(sources, min_rows=20, max_jump=None)
     except Exception as exc:
         gh_warning(f"VIX not updated ({exc})")
         return None
