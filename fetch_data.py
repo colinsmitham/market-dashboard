@@ -15,7 +15,7 @@ What it does (runs once per weekday via GitHub Actions):
           STOOQ_APIKEY. Without it, it is skipped.
   2. Checks the data is sane (enough rows, recent, no zero/blank prices).
   3. Calculates the signals and the framework tier for every day.
-  4. Runs a simple backtest: plain monthly DCA vs. the tiered approach.
+  4. Measures what QQQ did over the following 3 and 12 months after each tier.
   5. Writes everything to data/market.json.
 
 Safety rule: if every source fails, or the data looks wrong, the script
@@ -53,7 +53,8 @@ STOOQ_SYMBOL = "qqq.us"   # same fund on Stooq
 INCLUDE_VIX = True        # also fetch the VIX (shown as context only; it does
 VIX_TICKER = "^VIX"       # not affect the tier)
 
-HISTORY_YEARS = 3         # years of daily history written to the JSON / chart.
+HISTORY_YEARS = 15        # years of daily history written to the JSON / chart
+                          # (the widget's longest range button is 15Y).
                           # (Full history since 1999 is downloaded behind the
                           # scenes so the 200DMA and the all-time high are
                           # correct from the first day shown.)
@@ -75,9 +76,9 @@ TIERS = [
     {"id": 3, "name": "Aggressive", "multiplier": 3.0},
 ]
 
-# --- Backtest ---------------------------------------------------------------
-BACKTEST_ENABLED = True
-BACKTEST_MONTHLY_AMOUNT = 1000.0   # hypothetical base contribution (illustrative)
+# --- Historical context -----------------------------------------------------
+FORWARD_STUDY_ENABLED = True       # "What followed each tier" section
+FORWARD_HORIZONS = {"3m": 63, "12m": 252}   # look-ahead windows in trading days
 
 # --- Data checks --------------------------------------------------------------
 MIN_ROWS = MA_WINDOW + 260         # need at least ~1 year beyond the MA warm-up
@@ -277,59 +278,42 @@ def explain(row: pd.Series) -> str:
 
 
 # -----------------------------------------------------------------------------
-# 4. BACKTEST: plain monthly DCA vs. tiered DCA, same total dollars
+# 4. HISTORICAL CONTEXT: what QQQ did after each tier
 # -----------------------------------------------------------------------------
 
-def run_backtest(df: pd.DataFrame) -> dict | None:
-    """Buy on the first trading day of each month in the history window.
+def _round_or_none(v, nd=1):
+    """Round a number, or return None for missing values (JSON has no NaN)."""
+    return None if v is None or not math.isfinite(v) else round(float(v), nd)
 
-    Plain:  the same base amount every month.
-    Tiered: base amount x that day's tier multiplier, then every tiered
-            contribution is scaled by one constant so the TOTAL invested
-            equals the plain total. That makes it a fair "same dollars,
-            different timing" comparison. (The scaling uses hindsight about
-            the total, so treat the result as illustrative.)
-    Ending values use the latest close. Dividends are not included (both
-    strategies would receive them roughly equally).
+
+def forward_returns_by_tier(df: pd.DataFrame) -> dict | None:
+    """For every trading day with a tier (QQQ's full history), measure the
+    price return over the NEXT 3 and 12 months, then group by that day's tier.
+
+    This answers "historically, what happened after days like today?" without
+    any hindsight scaling. Caveats (shown on the page too): neighboring days
+    share most of their future, so the samples overlap heavily; a few big
+    episodes (2000-02, 2008, 2022) dominate the deeper tiers; dividends are
+    excluded; and the past does not predict the future.
     """
-    if df.empty:
+    if len(df) < max(FORWARD_HORIZONS.values()) + 20:
         return None
-    monthly = df.groupby([df.index.map(lambda d: d.year), df.index.map(lambda d: d.month)]).head(1)
-    if len(monthly) < 6:
-        return None
-
-    base = BACKTEST_MONTHLY_AMOUNT
-    mults = monthly["tier"].map(lambda t: TIERS[int(t)]["multiplier"])
-    plain_amounts = pd.Series(base, index=monthly.index)
-    scale = plain_amounts.sum() / (base * mults).sum()
-    tiered_amounts = base * mults * scale
-
-    last_close = float(df["close"].iloc[-1])
-
-    def summarize(amounts: pd.Series) -> dict:
-        shares = float((amounts / monthly["close"]).sum())
-        invested = float(amounts.sum())
-        value = shares * last_close
-        return {
-            "invested": round(invested, 2),
-            "shares": round(shares, 4),
-            "avg_cost": round(invested / shares, 2),
-            "value": round(value, 2),
-            "return_pct": round((value / invested - 1) * 100, 2),
-        }
-
-    plain, tiered = summarize(plain_amounts), summarize(tiered_amounts)
+    rows = []
+    for t in TIERS:
+        sub = df["tier"] == t["id"]
+        row = {"tier": t["id"], "days": int(sub.sum()),
+               "share_pct": _round_or_none(sub.mean() * 100)}
+        for label, n in FORWARD_HORIZONS.items():
+            fwd = ((df["close"].shift(-n) / df["close"] - 1) * 100)[sub].dropna()
+            row[f"median_{label}"] = _round_or_none(fwd.median()) if len(fwd) else None
+            row[f"positive_{label}"] = _round_or_none((fwd > 0).mean() * 100, 0) if len(fwd) else None
+            row[f"samples_{label}"] = int(len(fwd))
+        rows.append(row)
     return {
-        "start": monthly.index[0].isoformat(),
+        "start": df.index[0].isoformat(),
         "end": df.index[-1].isoformat(),
-        "months": int(len(monthly)),
-        "monthly_amount": base,
-        "scale_factor": round(float(scale), 4),
-        "tier_months": {str(t["id"]): int((monthly["tier"] == t["id"]).sum()) for t in TIERS},
-        "plain": plain,
-        "tiered": tiered,
-        "difference": round(tiered["value"] - plain["value"], 2),
-        "difference_pct": round((tiered["value"] / plain["value"] - 1) * 100, 2),
+        "horizons": FORWARD_HORIZONS,
+        "by_tier": rows,
     }
 
 
@@ -416,7 +400,8 @@ def build_payload(df: pd.DataFrame, source: str, vix: dict | None) -> dict:
             "ma": [round(float(v), 2) for v in hist["ma"]],
             "tier": [int(v) for v in hist["tier"]],
         },
-        "backtest": run_backtest(hist) if BACKTEST_ENABLED else None,
+        # Uses QQQ's FULL history, not just the years shown in the chart
+        "forward_returns": forward_returns_by_tier(df) if FORWARD_STUDY_ENABLED else None,
     }
 
 
