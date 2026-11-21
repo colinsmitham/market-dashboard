@@ -1,0 +1,64 @@
+# .github/workflows/update.yml
+# -----------------------------------------------------------------------------
+# Runs fetch_data.py every weekday after the US market close and commits the
+# refreshed data/market.json back to the repository. GitHub Pages then serves
+# the new file to the website widget automatically.
+# -----------------------------------------------------------------------------
+
+name: Update market data
+
+on:
+  schedule:
+    # GitHub schedules use UTC. 22:15 UTC Monday-Friday =
+    #   5:15 pm New York / 4:15 pm Dallas in winter (standard time)
+    #   6:15 pm New York / 5:15 pm Dallas in summer (daylight time)
+    # i.e. roughly 1-2 hours after the 4:00 pm ET close. GitHub sometimes
+    # starts scheduled runs 5-30 minutes late; that's normal.
+    - cron: "15 22 * * 1-5"
+  workflow_dispatch: {}    # adds a "Run workflow" button for manual runs
+
+# Lets the workflow push the updated JSON back to the repo
+permissions:
+  contents: write
+
+# Never let two runs overlap (e.g. a manual run during the scheduled one)
+concurrency:
+  group: update-market-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install libraries
+        # Unpinned on purpose: yfinance ships fixes quickly when Yahoo changes.
+        run: pip install --upgrade yfinance pandas requests
+
+      - name: Download prices and rebuild data/market.json
+        env:
+          # Optional. Only needed if you want Stooq as a third backup source.
+          # Leave the secret unset and this source is simply skipped.
+          STOOQ_APIKEY: ${{ secrets.STOOQ_APIKEY }}
+        run: python fetch_data.py
+
+      - name: Commit the new data (only if it changed)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/market.json
+          if git diff --cached --quiet; then
+            echo "Data unchanged (market holiday, or the fetch failed and the old file was kept)."
+            exit 0
+          fi
+          git commit -m "Update market data $(date -u +'%Y-%m-%d')"
+          git push
